@@ -76,6 +76,183 @@ def test_simple_predicates(dataset):
         assert dataset.to_table(filter=expr) == dataset.to_table().filter(expr)
 
 
+@pytest.mark.parametrize("stable_ids", [False, True])
+@pytest.mark.parametrize(
+    "predicate, expected",
+    [
+        ("CASE WHEN x > 0 THEN TRUE ELSE FALSE END", [2, 3]),
+        ("CASE x WHEN 0 THEN TRUE WHEN 2 THEN TRUE ELSE FALSE END", [1, 3]),
+        ("CASE WHEN x > 0 THEN TRUE END", [2, 3]),
+        ("NOT CASE WHEN x > 0 THEN TRUE END", []),
+        ("NOT CASE WHEN x > 0 THEN TRUE ELSE FALSE END", [0, 1, 4]),
+        ("CASE WHEN x > 0 THEN NULL ELSE TRUE END", [0, 1, 4]),
+        ("CASE x WHEN NULL THEN TRUE ELSE FALSE END", []),
+        ("(CASE WHEN x > 0 THEN TRUE END) IS NULL", [0, 1, 4]),
+        ("CASE WHEN x >= 0 THEN FALSE WHEN x > 0 THEN TRUE ELSE TRUE END", [0, 4]),
+        ("CASE WHEN x > 0 THEN 1 ELSE 1.5 END = 1.5", [0, 1, 4]),
+        ("CASE WHEN x = 0 THEN FALSE ELSE 12 / x > 0 END", [2, 3]),
+        (
+            "CASE WHEN x > 0 THEN CASE x WHEN 1 THEN FALSE ELSE TRUE END "
+            "ELSE FALSE END",
+            [3],
+        ),
+        ("id = 0 OR CASE WHEN x > 0 THEN TRUE ELSE FALSE END", [0, 2, 3]),
+        ("id >= 0 AND CASE WHEN x > 0 THEN TRUE ELSE FALSE END", [2, 3]),
+    ],
+)
+def test_case_filter(tmp_path, stable_ids, predicate, expected):
+    table = pa.table({"id": range(5), "x": [-1, 0, 1, 2, None]})
+    ds = lance.write_dataset(
+        table.slice(0, 4),
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=stable_ids,
+    )
+    ds.create_scalar_index("id", "BTREE")
+    # Keep one fragment outside the index, including a NULL CASE operand.
+    ds = lance.write_dataset(table.slice(4), tmp_path, mode="append")
+    assert len(ds.get_fragments()) == 3
+    for deleted in [False, True]:
+        if deleted:
+            ds.delete("id = 2")
+        ids = [i for i in expected if not (deleted and i == 2)]
+        for use_index in [False, True]:
+            actual = ds.to_table(
+                columns=["id"],
+                filter=predicate,
+                use_scalar_index=use_index,
+                batch_size=2,
+            )
+            assert actual["id"].to_pylist() == ids
+        assert ds.count_rows(filter=predicate) == len(ids)
+        assert (
+            ds.to_table(columns=["id"], filter=predicate, limit=1)["id"].to_pylist()
+            == ids[:1]
+        )
+
+
+def test_case_index_refinement(tmp_path):
+    ds = lance.write_dataset(
+        pa.table({"id": range(6), "x": [-1, 0, 1, 2, None, 3]}),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    ds.create_scalar_index("id", "BTREE")
+    scan = ds.scanner(
+        columns=["id"],
+        filter="id >= 2 AND CASE WHEN x IS NULL THEN TRUE ELSE x > 1 END",
+    )
+    assert "ScalarIndexQuery" in scan.explain_plan()
+    assert scan.to_table()["id"].to_pylist() == [3, 4, 5]
+
+
+@pytest.mark.parametrize("stable_ids", [False, True])
+def test_case_read_write(tmp_path, stable_ids):
+    table = pa.table(
+        {
+            "id": range(5),
+            "x": [-1, 0, 1, 2, None],
+            "text": ["7", "8", "9", "bad", "bad"],
+        }
+    )
+    ds = lance.write_dataset(
+        table,
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=stable_ids,
+    )
+    original_version = ds.version
+    ds.create_scalar_index("x", "BTREE")
+    expression = "CASE WHEN x > 0 THEN 1 ELSE 1.5 END"
+    projected = ds.to_table(columns={"result": expression})
+    assert projected == pa.table(
+        {"result": [1.5, 1.5, 1.0, 1.0, 1.5]},
+        schema=pa.schema([pa.field("result", pa.float64(), nullable=False)]),
+    )
+    ds.update(
+        {"x": "CASE WHEN x IS NULL THEN 9 ELSE x + 10 END"},
+        where="CASE WHEN id <= 2 THEN TRUE ELSE FALSE END",
+    )
+    ds.add_columns(
+        {
+            "label": "CASE WHEN x >= 10 THEN 'high' "
+            "WHEN x IS NULL THEN 'missing' ELSE 'low' END"
+        }
+    )
+    ds.merge_insert("id").when_matched_update_all(
+        "CASE WHEN target.x < 10 THEN source.x > 0 ELSE FALSE END"
+    ).execute(pa.table({"id": [0, 1], "x": [99, 99]}))
+    ds.delete("CASE label WHEN 'missing' THEN TRUE ELSE FALSE END")
+    actual = ds.to_table(columns=["id", "x", "label"]).sort_by("id")
+    assert actual == pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "x": [99, 10, 11, 2],
+            "label": ["low", "high", "high", "low"],
+        },
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                pa.field("x", pa.int64()),
+                pa.field("label", pa.string(), nullable=False),
+            ]
+        ),
+    )
+    for use_index in [False, True]:
+        assert ds.to_table(filter="x >= 10", use_scalar_index=use_index).sort_by("id")[
+            "id"
+        ].to_pylist() == [0, 1, 2]
+    version = ds.version
+    with pytest.raises(
+        (ValueError, RuntimeError, OSError), match="(?i)(cast|parse|convert)"
+    ):
+        ds.update({"x": "CASE WHEN id < 3 THEN x ELSE CAST(text AS BIGINT) END"})
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == version
+    assert reopened.to_table(columns=["id", "x", "label"]).sort_by("id") == actual
+    assert reopened.checkout_version(original_version).to_table() == table
+
+
+def test_case_update_non_nullable(tmp_path):
+    table = pa.Table.from_arrays(
+        [pa.array(range(4)), pa.array(range(4))],
+        schema=pa.schema(
+            [pa.field("id", pa.int64()), pa.field("x", pa.int64(), nullable=False)]
+        ),
+    )
+    ds = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    version = ds.version
+    with pytest.raises((ValueError, OSError), match="(?i)null"):
+        ds.update({"x": "CASE WHEN id < 2 THEN x END"})
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == version
+    assert reopened.to_table() == table
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        "any_element(items, 'CASE WHEN x IS NULL THEN FALSE ELSE x > 0 END')",
+        "array_any_match(items, e -> "
+        "CASE WHEN e.x IS NULL THEN FALSE ELSE e.x > 0 END)",
+    ],
+)
+def test_case_element_predicate(tmp_path, predicate):
+    ds = lance.write_dataset(
+        pa.table(
+            {"id": range(4), "items": [[{"x": 1}, {"x": -1}], [{"x": None}], [], None]}
+        ),
+        tmp_path,
+        max_rows_per_file=2,
+    )
+    assert ds.to_table(columns=["id"], filter=predicate)["id"].to_pylist() == [0]
+    with pytest.raises(ValueError, match="immutable"):
+        ds.to_table(
+            filter="any_element(items, "
+            "'CASE WHEN TRUE THEN TRUE ELSE random() > 0 END')"
+        )
+
+
 def test_pyarrow_predicate_with_default_row_id(tmp_path: Path):
     table = pa.table({"uid": [1, 2, 3], "number": [10, 20, 10]})
     lance.write_dataset(table, tmp_path)

@@ -28,7 +28,7 @@ use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
 use datafusion::execution::context::{SessionContext, SessionState};
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{Case, ScalarFunction};
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawFieldAccessExpr};
 use datafusion::logical_expr::{
@@ -983,6 +983,47 @@ impl Planner {
                 Ok(value_expr.in_list(list_exprs, *negated))
             }
             SQLExpr::Nested(inner) => self.parse_sql_expr(inner.as_ref()),
+            SQLExpr::Case {
+                operand,
+                conditions,
+                else_result,
+                ..
+            } => Ok(Expr::Case(Case::new(
+                // Use CASE TRUE to bypass DataFusion 55.2.0's boolean CASE-to-AND/OR
+                // rewrite, which requires `expr: None` and can expose unselected branches
+                // to evaluation.
+                //
+                // For x = [0, 1, 2], this CASE safely returns [FALSE, TRUE, TRUE]:
+                //   CASE WHEN x = 0 THEN FALSE ELSE 12 / x > 0 END
+                // The AND form, `(x = 0) IS NOT TRUE AND (12 / x > 0)`, can divide by zero
+                // because AND/OR may evaluate the right operand on the entire batch:
+                // https://github.com/apache/datafusion/blob/55.2.0/datafusion/physical-expr/src/expressions/binary.rs#L1180
+                Some(Box::new(Expr::Literal(
+                    ScalarValue::Boolean(Some(true)),
+                    None,
+                ))),
+                conditions
+                    .iter()
+                    .map(|branch| {
+                        Ok((
+                            Box::new(match operand {
+                                // Use explicit `=` so simple CASE follows Lance's equality rules.
+                                Some(operand) => self.binary_expr(
+                                    operand,
+                                    &BinaryOperator::Eq,
+                                    &branch.condition,
+                                )?,
+                                None => self.parse_sql_expr(&branch.condition)?,
+                            }),
+                            Box::new(self.parse_sql_expr(&branch.result)?),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                else_result
+                    .as_ref()
+                    .map(|expr| self.parse_sql_expr(expr).map(Box::new))
+                    .transpose()?,
+            ))),
             SQLExpr::Substring {
                 expr,
                 substring_from,
@@ -1734,18 +1775,109 @@ mod tests {
         }
     }
 
-    #[rstest::rstest]
-    #[case("CASE WHEN value > 1 THEN TRUE ELSE FALSE END")]
-    #[case("CASE value WHEN 1 THEN TRUE ELSE FALSE END")]
-    fn test_case_filters_remain_unsupported(#[case] filter: &str) {
-        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int32,
-            true,
-        )])));
-        let error = planner.parse_filter(filter).unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("not supported SQL"));
+    #[rstest]
+    #[case::searched("CASE WHEN x > 0 THEN TRUE ELSE FALSE END", vec![Some(false), Some(false), Some(true), Some(true), Some(false)])]
+    #[case::simple("CASE x WHEN 0 THEN TRUE ELSE FALSE END", vec![Some(false), Some(true), Some(false), Some(false), Some(false)])]
+    #[case::implicit_else("CASE WHEN x > 0 THEN TRUE END", vec![None, None, Some(true), Some(true), None])]
+    #[case::null_condition("CASE WHEN NULL THEN TRUE ELSE FALSE END", vec![Some(false); 5])]
+    #[case::null_operand("CASE x WHEN NULL THEN TRUE ELSE FALSE END", vec![Some(false); 5])]
+    #[case::negated("NOT CASE WHEN x > 0 THEN TRUE ELSE FALSE END", vec![Some(true), Some(true), Some(false), Some(false), Some(true)])]
+    #[case::null_result("CASE WHEN x > 0 THEN NULL ELSE TRUE END", vec![Some(true), Some(true), None, None, Some(true)])]
+    #[case::first_match("CASE WHEN x >= 0 THEN TRUE WHEN x > 0 THEN FALSE ELSE FALSE END", vec![Some(false), Some(true), Some(true), Some(true), Some(false)])]
+    #[case::nested("CASE WHEN x > 0 THEN CASE x WHEN 1 THEN FALSE ELSE TRUE END ELSE FALSE END", vec![Some(false), Some(false), Some(false), Some(true), Some(false)])]
+    #[case::promotion("CASE WHEN x > 0 THEN 1 ELSE 1.5 END = 1.5", vec![Some(true), Some(true), Some(false), Some(false), Some(true)])]
+    #[case::guarded_division("CASE WHEN x = 0 THEN FALSE ELSE 12 / x > 0 END", vec![Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::guarded_condition("CASE WHEN x = 0 THEN TRUE WHEN 12 / x > 0 THEN TRUE ELSE FALSE END", vec![Some(false), Some(true), Some(true), Some(true), Some(false)])]
+    #[case::guarded_cast("CASE WHEN x = 0 THEN CAST(text AS BIGINT) > 0 ELSE FALSE END", vec![Some(false), Some(true), Some(false), Some(false), Some(false)])]
+    #[case::all_null("CASE WHEN x > 0 THEN CAST(NULL AS BOOLEAN) END", vec![None; 5])]
+    #[case::simple_result("CASE x WHEN 0 THEN 1.5 ELSE 1 END = 1.5", vec![Some(false), Some(true), Some(false), Some(false), Some(false)])]
+    fn test_case_expressions(#[case] sql: &str, #[case] expected: Vec<Option<bool>>) {
+        let batch = arrow_array::record_batch!(
+            ("x", Int32, [Some(-1), Some(0), Some(1), Some(2), None]),
+            ("text", Utf8, ["bad", "7", "bad", "bad", "bad"])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        for expr in [planner.parse_filter(sql), planner.parse_expr(sql)] {
+            let optimized = planner.optimize_expr(expr.unwrap()).unwrap();
+            assert_eq!(planner.optimize_expr(optimized.clone()).unwrap(), optimized);
+            let result = planner
+                .create_physical_expr(&optimized)
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(
+                result.as_ref(),
+                &BooleanArray::from(expected.clone()),
+                "{sql}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::simple_zero("CASE f WHEN 0.0 THEN TRUE ELSE FALSE END", vec![true, true, false, false, false, false])]
+    #[case::searched_zero("CASE WHEN f = 0.0 THEN TRUE ELSE FALSE END", vec![true, true, false, false, false, false])]
+    #[case::simple_nan("CASE f WHEN CAST('NaN' AS DOUBLE) THEN TRUE ELSE FALSE END", vec![false, false, false, false, true, true])]
+    #[case::searched_nan("CASE WHEN f = CAST('NaN' AS DOUBLE) THEN TRUE ELSE FALSE END", vec![false, false, false, false, true, true])]
+    fn test_case_float_comparisons(#[case] sql: &str, #[case] expected: Vec<bool>) {
+        let batch = arrow_array::record_batch!((
+            "f",
+            Float64,
+            [
+                Some(0.0),
+                Some(-0.0),
+                Some(1.0),
+                None,
+                Some(f64::NAN),
+                Some(-f64::NAN)
+            ]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(sql).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(result.as_ref(), &BooleanArray::from(expected), "{sql}");
+    }
+
+    #[rstest]
+    #[case::condition("CASE WHEN 1 THEN TRUE ELSE FALSE END", "Failed to coerce case", false)]
+    #[case::branches("CASE WHEN x > 0 THEN 1 ELSE make_array(1) END", "common types", false)]
+    #[case::missing_column("CASE WHEN x > 0 THEN missing ELSE x END", "missing", false)]
+    #[case::literal_cast(
+        "CASE WHEN x > 0 THEN TRUE ELSE CAST('bad' AS BOOLEAN) END",
+        "Cannot cast",
+        true
+    )]
+    fn test_case_invalid_expressions(
+        #[case] sql: &str,
+        #[case] message: &str,
+        #[case] is_cast_error: bool,
+    ) {
+        let batch = arrow_array::record_batch!(("x", Int32, [1])).unwrap();
+        let planner = Planner::new(batch.schema());
+        let error = planner
+            .parse_expr(sql)
+            .and_then(|expr| planner.optimize_expr(expr))
+            .unwrap_err();
+        assert!(
+            if is_cast_error {
+                matches!(error, Error::Arrow { .. })
+            } else {
+                matches!(error, Error::InvalidInput { .. })
+            },
+            "{error}"
+        );
+        assert!(error.to_string().contains(message), "{sql}: {error}");
     }
 
     #[rstest::rstest]

@@ -1548,14 +1548,18 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::comparison("x < 0")]
+    #[case::searched("CASE WHEN x < 0 THEN TRUE ELSE FALSE END")]
+    #[case::simple("CASE x WHEN 0 THEN TRUE END")]
+    #[case::nested("CASE WHEN x > 0 THEN CASE x WHEN 1 THEN TRUE ELSE FALSE END END")]
     #[tokio::test]
-    async fn test_expr_substrait_roundtrip() {
+    async fn test_expr_substrait_roundtrip(#[case] sql: &str) {
         let schema = arrow_schema::Schema::new(vec![Field::new("x", DataType::Int32, true)]);
-        let expr = Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(Expr::Column(Column::new_unqualified("x"))),
-            op: Operator::Lt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(0)), None)),
-        });
+        let planner = crate::planner::Planner::new(Arc::new(schema.clone()));
+        let expr = planner
+            .optimize_expr(planner.parse_filter(sql).unwrap())
+            .unwrap();
 
         let bytes =
             encode_substrait(expr.clone(), Arc::new(schema.clone()), &session_state()).unwrap();

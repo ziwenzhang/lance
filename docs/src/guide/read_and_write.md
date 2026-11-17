@@ -560,6 +560,40 @@ Currently, Lance supports a growing list of expressions.
 * `regexp_match(column, pattern)`
 * `any_element(list_column, 'predicate')` (experimental), see [below](#filtering-on-elements-of-a-list-of-structs)
 * `CAST`
+* `CASE WHEN condition THEN value ... [ELSE value] END`
+* `CASE expression WHEN value THEN result ... [ELSE result] END`
+
+`CASE` returns the result of the first matching branch, even if that result is
+NULL. A NULL condition does not match, and an omitted `ELSE` returns NULL.
+Simple CASE uses ordinary equality, so `CASE value WHEN NULL ...` never matches
+NULL; use `CASE WHEN value IS NULL ...` instead. Branch results must have
+compatible types.
+
+CASE expressions can be used in scan filters and projections,
+[updates](#updating-rows), [delete filters](#deleting-rows),
+[merge conditions](#merge-insert), and
+[computed columns](data_evolution.md#with-data-backfill).
+For a dataset with a `score` column:
+
+```python
+category = (
+    "CASE WHEN score IS NULL THEN 'missing' "
+    "WHEN score >= 0.5 THEN 'high' ELSE 'low' END"
+)
+ds.to_table(columns={"category": category})
+ds.to_table(filter=f"({category}) = 'high'")
+```
+
+Only TRUE passes a filter; FALSE and NULL are both excluded. FALSE and NULL are
+not interchangeable inside expressions such as `NOT CASE ... END`.
+Independent indexed predicates combined with CASE using `AND` can still prune
+rows; the remaining CASE expression is evaluated on the candidate rows.
+
+At execution time, CASE evaluates conditions in order and evaluates a result
+expression only for rows selecting that branch. As with other expressions,
+literal casts are validated during planning, including inside CASE branches.
+Use column-dependent expressions when guarding fallible conversions on
+individual rows.
 
 For example, the following filter string is acceptable:
 
